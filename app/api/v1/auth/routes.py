@@ -1,0 +1,208 @@
+from datetime import timedelta
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import select, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.services.role_resolver import resolve_role
+from app.services.auth_service import AuthService
+from app.schemas.user import StudentSelfRegistration, UserCreate, UserCreateResponse, UserResponse
+from app.models.student_model import Student
+from app.models.user import User
+from app.services.audit_service import audit_log_service, login_history_service
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+router = APIRouter()
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    payload = AuthService.verify_token(token)
+    if payload is None:
+        raise credentials_exception
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise credentials_exception
+
+    try:
+        user_uuid = UUID(user_id)
+    except ValueError:
+        raise credentials_exception
+
+    result = await db.execute(select(User).where(User.id == user_uuid))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+@router.post("/register", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
+async def register(
+    user_in: UserCreate,
+    db: AsyncSession = Depends(get_db),
+) -> UserCreateResponse:
+    email_result = await db.execute(select(User).where(User.email == user_in.email))
+    if email_result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered",
+        )
+
+    username_result = await db.execute(
+        select(User).where(User.username == user_in.username)
+    )
+    if username_result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already registered",
+        )
+
+    role = await resolve_role(db, user_in.role_id)
+
+    hashed_password = AuthService.hash_password(user_in.password)
+    new_user = User(
+        username=user_in.username,
+        email=user_in.email,
+        password_hash=hashed_password,
+        phone=user_in.phone,
+        status=user_in.status,
+        role_id=role.id,
+    )
+
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    response = UserCreateResponse.model_validate(new_user)
+    response.created_id = new_user.id
+    return response
+
+
+@router.post("/register/student", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
+async def register_student(
+    registration: StudentSelfRegistration,
+    db: AsyncSession = Depends(get_db),
+) -> UserCreateResponse:
+    """Create a student login and its required student profile in one transaction."""
+    email_result = await db.execute(select(User).where(User.email == registration.email))
+    if email_result.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+
+    username_result = await db.execute(select(User).where(User.username == registration.username))
+    if username_result.scalar_one_or_none() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already registered")
+
+    role = await resolve_role(db, "0004")
+    new_user = User(
+        username=registration.username,
+        email=registration.email,
+        password_hash=AuthService.hash_password(registration.password),
+        phone=registration.phone,
+        status=True,
+        role_id=role.id,
+    )
+    db.add(new_user)
+    await db.flush()
+
+    student = Student(
+        user_id=new_user.id,
+        admission_no=f"STU-{str(new_user.id).split('-')[0].upper()}",
+        first_name=registration.first_name,
+        last_name=registration.last_name,
+        gender=registration.gender,
+        class_name=registration.class_name,
+        roll_no=registration.roll_no,
+    )
+    db.add(student)
+    await db.commit()
+    await db.refresh(new_user)
+
+    response = UserCreateResponse.model_validate(new_user)
+    response.created_id = new_user.id
+    response.message = "Student account and profile created successfully"
+    return response
+
+
+@router.post("/login")
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: AsyncSession = Depends(get_db),
+    request: Request = None,
+) -> dict:
+    result = await db.execute(
+        select(User).where(
+            or_(User.email == form_data.username, User.username == form_data.username)
+        )
+    )
+    user = result.scalar_one_or_none()
+
+    if user is None or not AuthService.verify_password(
+        form_data.password, user.password_hash
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.status:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Inactive user",
+        )
+
+    login_record = await login_history_service.create_login_record(db, {
+        "user_id": user.id,
+        "device": request.headers.get("user-agent") if request else None,
+        "ip_address": request.client.host if request and request.client else None,
+    }, commit=False)
+    await audit_log_service.create_log(db, {
+        "user_id": user.id, "activity": "User Login", "details": "Successful login"
+    }, commit=False)
+    await db.commit()
+
+    access_token = AuthService.create_access_token(
+        data={"sub": str(user.id), "sid": str(login_record.id)},
+        expires_delta=timedelta(minutes=AuthService.ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/logout")
+async def logout(
+    token: str = Depends(oauth2_scheme),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = AuthService.verify_token(token) or {}
+    session_id = payload.get("sid")
+    if session_id:
+        try:
+            await login_history_service.update_logout_record(db, UUID(session_id), commit=False)
+        except (ValueError, HTTPException):
+            pass
+    await audit_log_service.create_log(db, {"user_id": current_user.id, "activity": "User Logout", "details": "User logged out"}, commit=False)
+    await db.commit()
+    return {"message": "Logged out successfully"}
+
+
+@router.get("/me", response_model=UserResponse)
+async def read_users_me(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    return current_user
